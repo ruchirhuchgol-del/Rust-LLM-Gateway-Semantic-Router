@@ -1737,19 +1737,7 @@ Possible additions:
 
 ---
 
-# Documentation
 
-| Document                                           | Purpose                            |
-| -------------------------------------------------- | ---------------------------------- |
-| [ARCHITECTURE.md](ARCHITECTURE.md)                 | Detailed system architecture       |
-| [API.md](API.md)                                   | API behavior and schemas           |
-| [CONFIGURATION.md](CONFIGURATION.md)               | Configuration reference            |
-| [SECURITY.md](SECURITY.md)                         | Security model and threat analysis |
-| [BENCHMARKS.md](BENCHMARKS.md)                     | Performance measurements           |
-| [DEVELOPMENT.md](DEVELOPMENT.md)                   | Development workflow               |
-| [TEST_REPORT.md](TEST_REPORT.md)                   | Test execution evidence            |
-| [COMPLETION_REPORT.md](COMPLETION_REPORT.md)       | Requirement acceptance matrix      |
-| [FINAL_RELEASE_REPORT.md](FINAL_RELEASE_REPORT.md) | Final release assessment           |
 
 ---
 
