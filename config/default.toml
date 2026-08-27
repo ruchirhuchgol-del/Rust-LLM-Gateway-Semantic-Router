@@ -1,0 +1,63 @@
+# Rust LLM Gateway - default configuration
+# Override via environment variables using the APP__ prefix (double underscore = nested key).
+# Example: APP__SERVER__PORT=9000
+
+[server]
+host = "0.0.0.0"
+port = 8080
+# Per-connection request body size limit (bytes). 4 MB keeps large chat payloads safe.
+max_body_bytes = 4_194_304
+
+[auth]
+# Client API keys validated on every request. NEVER commit real keys; use env vars
+# (APP__AUTH__VALID_API_KEYS="key1,key2") in production.
+valid_api_keys = ["dev-key-1", "dev-key-2"]
+
+[rate_limit]
+# Default per-API-key limits. Token-bucket capacity (burst) == default_rpm.
+default_rpm = 60
+default_tpm = 90_000
+
+[cache]
+# Exact hash cache (SHA-256 of model + prompt + temperature=0)
+exact_max_entries = 50_000
+exact_ttl_seconds = 3_600
+
+# Semantic cache (Phase 2 - stub)
+semantic_enabled = false
+semantic_threshold = 0.96
+
+[circuit_breaker]
+# Trip after 3 consecutive failures (5xx, timeout, 429)
+failure_threshold = 3
+# Cool-down before half-open probe
+cooldown_seconds = 10
+# Max concurrent probe requests while half-open
+half_open_max_calls = 1
+
+[[providers]]
+name = "primary-local-vllm"
+endpoint = "http://localhost:8000"
+api_key = ""
+priority = 1
+connect_timeout_seconds = 5
+request_timeout_seconds = 30
+stream_idle_timeout_seconds = 120
+
+[[providers]]
+name = "secondary-groq"
+endpoint = "https://api.groq.com/openai"
+api_key = ""
+priority = 2
+connect_timeout_seconds = 5
+request_timeout_seconds = 20
+stream_idle_timeout_seconds = 120
+
+[[providers]]
+name = "tertiary-openai"
+endpoint = "https://api.openai.com"
+api_key = ""
+priority = 3
+connect_timeout_seconds = 5
+request_timeout_seconds = 20
+stream_idle_timeout_seconds = 120

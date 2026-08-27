@@ -1,0 +1,60 @@
+[package]
+name = "rust-llm-gateway"
+version = "0.1.0"
+edition = "2021"
+description = "High-Concurrency Rust LLM Gateway & Semantic Router"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "rust_llm_gateway"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rust-llm-gateway"
+path = "src/main.rs"
+
+[[bin]]
+name = "benchmark_suite"
+path = "benchmarks/main.rs"
+
+[dependencies]
+# Async runtime & networking
+tokio = { version = "1.38", features = ["full"] }
+axum = { version = "0.7", features = ["macros"] }
+tower = { version = "0.4", features = ["util", "timeout"] }
+tower-http = { version = "0.5", features = ["trace", "cors", "limit"] }
+reqwest = { version = "0.12", features = ["json", "stream", "gzip"] }
+futures-util = "0.3"
+async-stream = "0.3"
+bytes = "1.6"
+
+# Serialization & config
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+config = "0.14"
+
+# Concurrency & fast caching
+dashmap = "6.0"
+moka = { version = "0.12", features = ["future"] }
+sha2 = "0.10"
+
+# Observability & metrics
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+metrics = "0.23"
+metrics-exporter-prometheus = { version = "0.15", default-features = false }
+
+# Misc utilities
+uuid = { version = "1.10", features = ["v4"] }
+subtle = "2.6"
+
+[dev-dependencies]
+tokio = { version = "1.38", features = ["test-util"] }
+toml = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
