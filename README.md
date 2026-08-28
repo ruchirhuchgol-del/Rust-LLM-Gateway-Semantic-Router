@@ -1,318 +1,1863 @@
 # Rust LLM Gateway & Semantic Router
 
-```
-  ____ _   _ ____ _____   _     _     __  __    ____    _  _____ ______        __  _ __   __
- |  _ \ | | / ___|_   _| | |   | |   |  \/  |  / ___|  / \|_   _| ____\ \      / / / \\ \ / /
- | |_) | | | \___ \ | |   | |   | |   | |\/| | | |  _  / _ \ | | |  _|  \ \ /\ / / / _ \\ V / 
- |  _ <| |_| |___) || |   | |___| |___| |  | | | |_| |/ ___ \| | | |___  \ V  V / / ___ \| |  
- |_| \_\\___/|____/ |_|   |_____|_____|_|  |_|  \____/_/   \_\_| |_____|  \_/\_/ /_/   \_\_|  
+> A high-performance, OpenAI-compatible LLM gateway built in Rust for
+> multi-provider routing, token-aware rate limiting, streaming inference,
+> caching, failure recovery, and observability.
 
-```
-
-**An enterprise-grade, high-concurrency LLM routing plane and semantic cache engine built in Rust to decouple generative AI applications from upstream model providers.**
-
----
-
-## Executive Summary & Engineering Motivation
-
-Production generative AI architectures face three fundamental engineering bottlenecks:
-
-1. **Vendor Lock-in & Interface Fragmentation:** Provider SDKs (OpenAI, Anthropic, Mistral, self-hosted vLLM/Ollama) force applications to maintain bespoke client layers, retry mechanisms, and authentication policies.
-2. **Unbounded Cost & Latency Volatility:** LLM inferences are computationally expensive and non-deterministic in response duration. Repeated queries waste upstream token budgets without transparent caching.
-3. **Cascading Failure & Rate-Limit Starvation:** Upstream 429s, API outages, and fluctuating rate limits directly degrade downstream user experience without centralized circuit breaking or dynamic failover.
-
-**Rust LLM Gateway** sits as a zero-overhead reverse proxy between your application fleet and upstream AI providers, centralizing security, admission control, response caching, stream inspection, and multi-provider failover behind a unified, standard OpenAI-compatible API.
+[![Rust](https://img.shields.io/badge/Rust-2021-orange?logo=rust)](https://www.rust-lang.org/)
+[![Tokio](https://img.shields.io/badge/Runtime-Tokio-blue)](https://tokio.rs/)
+[![Axum](https://img.shields.io/badge/Web-Axum-purple)](https://github.com/tokio-rs/axum)
+[![Reqwest](https://img.shields.io/badge/HTTP-Reqwest-green)](https://github.com/seanmonstar/reqwest)
+[![Tests](https://img.shields.io/badge/Tests-36%2F36%20Passing-brightgreen)](#testing)
+[![Status](https://img.shields.io/badge/Status-v1.0.0--alpha-orange)](#project-status)
 
 ---
 
-## The Architectural Shift
+## Project Status
 
-```mermaid
-flowchart TD
-    subgraph Problem[" ❌ Fragmented Architecture: High Coupling & Risk "]
-        direction TB
-        App1[App Service A] -->|Direct API Keys & Ad-hoc Retries| OAI1[OpenAI API]
-        App1 -->|Custom SDK & Rate Limit Handling| ANT1[Anthropic API]
-        App1 -->|Uncached Raw Traffic| LOC1[Local vLLM / Ollama]
-        App2[App Service B] --> OAI1
-        App2 --> ANT1
-        App2 --> LOC1
-    end
+**Release Candidate — v1.0.0-alpha**
 
-    subgraph Solution[" 🚀 Unified Control Plane: Centralized & Isolated "]
-        direction TB
-        A1[App Service A] & A2[App Service B] & A3[Autonomous Agents / CLI]
-        -->|Single Base URL & Uniform API Key| GW["🦀 Rust LLM Gateway
-        ├── Constant-Time SHA-256 Auth & Trace Propagation
-        ├── Dual Token Bucket (RPM) & Dynamic Budget (TPM) Admission
-        ├── Exact Hash & Cosine Similarity Semantic Cache
-        ├── Provider Failover State Machine (Circuit Breaker)
-        └── Zero-Copy Streaming SSE Pipeline with TTFT Hook"]
-        GW -->|Managed Connection Pool| OAI[OpenAI]
-        GW -->|Payload Translation & Fallback| ANT[Anthropic]
-        GW -->|Low-Latency Private Pipe| LOC[Local vLLM / Ollama]
-    end
+The core gateway implementation, resilience mechanisms, streaming pipeline,
+caching engine, authentication, rate limiting, observability, integration
+tests, and release validation are implemented and verified.
 
-    style GW fill:#b03a2e,stroke:#f39c12,stroke-width:2px,color:#fff
+Current validation includes:
 
-```
+- 36/36 automated tests passing
+- `cargo check --all-targets` passing
+- `cargo clippy --all-targets --all-features -- -D warnings` passing
+- `cargo fmt --check` passing
+- 0.22 ms measured p95 net gateway overhead
+- 5,375 RPS peak measured throughput
+- 5.48 MB idle process working set
+- 100% success at 1,000 concurrent requests
+
+The 5K–10K localhost stress tests were also executed. Those runs were
+constrained by Windows TCP ephemeral-port exhaustion rather than a gateway
+panic or runtime crash. See [Concurrency & Limitations](#concurrency--limitations).
 
 ---
 
-## Deep-Dive: Core Subsystems & Technical Mechanics
+# Table of Contents
 
-### 1. Dual-Tier Rate Limiting & Token Admission Control
-
-Standard API gateways limit solely by Requests-Per-Minute (RPM). LLMs, however, are bound by **Tokens-Per-Minute (TPM)** quotas.
-
-* **Pre-Execution Reservation:** Prior to upstream dispatch, the gateway estimates the prompt and completion footprint, reserving capacity against a concurrent in-memory token bucket.
-* **Post-Execution Reconciliation:** If a request terminates early, hits cache, or generates fewer tokens than estimated, the unused allocation is instantly credited back to the budget in constant time ($O(1)$).
-* **Backpressure Guarantee:** Upstream providers are shielded from burst saturation; clients receive deterministic `429 Too Many Requests` responses with explicit `Retry-After` headers before consuming network hops.
-
-### 2. Dual-Layer Caching Engine
-
-```
-Incoming Payload
-      │
-      ├── [Temp == 0] ──► SHA-256 Hash Key ──► Moka Exact Cache (Hit: 0.14 ms)
-      │
-      └── [Temp > 0]  ──► Vector Embedding ──► Cosine Similarity Match (> Threshold)
-
-```
-
-* **Exact Cache:** Operates on deterministic inferences ($temperature = 0$) using canonical payload hashing with bounded, lock-free memory management via Moka.
-* **Semantic Similarity Engine:** Normalizes prompt structures and performs cosine similarity vector comparisons against cached embeddings to eliminate redundant upstream inferences on semantically identical prompts.
-
-### 3. Non-Buffering SSE Stream Pipeline & TTFT Tracking
-
-Traditional proxies buffer entire responses in memory, delaying token delivery and spiking memory footprints.
-
-* **Byte-Level Chunk Processing:** Streams incoming HTTP chunks directly through a sliding-window SSE parser without waiting for newline frame alignment.
-* **True TTFT Extraction:** Time-to-First-Token is measured strictly when the first model payload chunk arrives—differentiating model inference lag from connection negotiation latency.
-* **1 MiB Hard Buffer Ceiling:** Guards the gateway against malicious or malformed streaming payloads while maintaining low memory pressure.
-
-### 4. Resilient Provider Routing & Circuit Breaking
-
-```mermaid
-stateDiagram-v2
-    [*] --> CLOSED: Initial Healthy State
-    
-    CLOSED --> OPEN: Consecutive 5xx / Network Timeouts >= Threshold
-    note right of CLOSED
-      Standard routing to primary provider
-      Zero failover overhead
-    end note
-
-    OPEN --> HALF_OPEN: Cooldown Interval Elapsed
-    note right of OPEN
-      Fast-path reroute to fallback providers
-      Upstream shielded from traffic
-    end note
-
-    HALF_OPEN --> CLOSED: Probe Request Completes Successfully
-    HALF_OPEN --> OPEN: Probe Request Fails
-    note right of HALF_OPEN
-      Single canary request dispatched
-      Strict traffic isolation
-    end note
-
-```
+- [Why This Project](#why-this-project)
+- [What It Does](#what-it-does)
+- [Architecture](#architecture)
+- [Request Lifecycle](#request-lifecycle)
+- [System Design Principles](#system-design-principles)
+- [Core Components](#core-components)
+- [Provider Routing & Resilience](#provider-routing--resilience)
+- [Streaming Architecture](#streaming-architecture)
+- [Rate Limiting & Admission Control](#rate-limiting--admission-control)
+- [Caching Architecture](#caching-architecture)
+- [Observability](#observability)
+- [Security](#security)
+- [API](#api)
+- [Configuration](#configuration)
+- [Performance](#performance)
+- [Concurrency & Limitations](#concurrency--limitations)
+- [Testing](#testing)
+- [Project Structure](#project-structure)
+- [Running Locally](#running-locally)
+- [Docker](#docker)
+- [Design Decisions](#design-decisions)
+- [Known Limitations](#known-limitations)
+- [Roadmap](#roadmap)
+- [Documentation](#documentation)
+- [License](#license)
 
 ---
 
-## Performance Profile & Production Benchmarks
+# Why This Project?
 
-All metrics were gathered using optimized release builds (`opt-level = 3`, LTO enabled, single codegen unit, panic abort, symbol stripping).
+Modern applications increasingly depend on multiple LLM providers:
 
+- OpenAI
+- Anthropic
+- Groq
+- local vLLM deployments
+- Ollama
+- other OpenAI-compatible inference servers
+
+Directly integrating every application with every provider creates
+operational problems:
+
+```text
+                    Without a Gateway
+
+Application A ───────► OpenAI
+Application A ───────► Anthropic
+Application A ───────► Ollama
+
+Application B ───────► OpenAI
+Application B ───────► Anthropic
+Application B ───────► Ollama
+
+                 duplicated logic
+                         │
+                         ├── authentication
+                         ├── rate limiting
+                         ├── retries
+                         ├── failover
+                         ├── caching
+                         └── observability
+````
+
+The gateway centralizes those concerns:
+
+```text
+                         ┌──────────────────────┐
+                         │    Applications      │
+                         └──────────┬───────────┘
+                                    │
+                                    ▼
+                         ┌──────────────────────┐
+                         │ Rust LLM Gateway     │
+                         │                      │
+                         │ Auth                 │
+                         │ Rate Limiting        │
+                         │ Caching              │
+                         │ Routing              │
+                         │ Circuit Breaking     │
+                         │ Streaming            │
+                         │ Observability        │
+                         └──────────┬───────────┘
+                                    │
+                 ┌──────────────────┼──────────────────┐
+                 ▼                  ▼                  ▼
+             OpenAI             Anthropic          Local LLM
+                                                    vLLM/Ollama
 ```
-SYSTEM OVERHEAD (Target: ≤ 5.00 ms)
-[▓] 0.22 ms p95 (95.6% below maximum latency SLA)
 
-MEMORY FOOTPRINT (Idle Target: < 50 MB)
-[▓▓] 5.48 MB (89.0% below target ceiling)
-
-CACHE ACCESS LATENCY
-[▓] 0.14 ms p50 Exact Retrieval
-
-```
-
-### Concurrency Stress Test Analysis
-
-```
-Concurrency  Requests   Throughput    Latency (p50)   Latency (p95)   Working Set (RSS)
-───────────────────────────────────────────────────────────────────────────────────────
-100          200        4,039 RPS      18.93 ms        33.13 ms        19.52 MB
-500        1,000        5,375 RPS      72.85 ms       117.54 ms        46.24 MB
-1,000      2,000        4,231 RPS     198.52 ms       290.69 ms       115.80 MB
-
-```
-
-> **Verification Note:** 1,000 concurrent client connections execute with 100% request success. Higher localhost burst limits (5K–10K) were bounded by Windows OS ephemeral socket exhaustion (`WSAEADDRINUSE`) during instant barrier releases, while the gateway runtime process remained fully stable without crashes or memory corruption.
+The goal is to provide a single OpenAI-compatible interface while moving
+provider complexity into an infrastructure layer.
 
 ---
 
-## Complete Request Lifecycle
+# What It Does
 
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Client as Client Application
-    participant GW as Rust Gateway Core
-    participant Cache as Cache Layer (Exact/Semantic)
-    participant Router as Provider Selector & Circuit Breaker
-    participant Upstream as Primary LLM Provider
-    participant Fallback as Secondary LLM Provider
+The gateway provides:
 
-    Client->>GW: POST /v1/chat/completions
-    GW->>GW: 1. Constant-Time Auth Verification
-    GW->>GW: 2. Rate Limit (RPM) & Token Budget (TPM) Check
-    
-    GW->>Cache: 3. Query Hash / Embedding Vector
-    alt Cache Hit
-        Cache-->>GW: Return Cached Response Body
-        GW->>GW: Refund Unused Reserved Tokens
-        GW-->>Client: 200 OK (0.14 ms response)
-    else Cache Miss
-        GW->>Router: 4. Evaluate Provider Health State
-        alt Primary Circuit Breaker OPEN
-            Router->>Fallback: Dispatch Request to Backup Model
-            Fallback-->>GW: Stream Response Chunks
-        else Primary Circuit Breaker CLOSED
-            Router->>Upstream: Dispatch Request to Primary Model
-            Upstream-->>GW: Stream Response Chunks
-        end
-        GW->>GW: 5. Incremental SSE Parse & TTFT Hook
-        GW-->>Client: 6. Real-time Zero-Copy Token Stream
-        GW->>GW: 7. Reconcile Usage & Push Prometheus Telemetry
-    end
-
-```
+| Capability            | Purpose                                   |
+| --------------------- | ----------------------------------------- |
+| OpenAI-compatible API | Unified client interface                  |
+| Bearer authentication | Client authorization                      |
+| RPM rate limiting     | Request admission control                 |
+| TPM admission control | Token-aware budget enforcement            |
+| Exact caching         | Avoid repeated deterministic inference    |
+| Semantic cache engine | Similarity-based response lookup          |
+| Provider routing      | Select eligible upstream providers        |
+| Circuit breaker       | Isolate unhealthy providers               |
+| Automatic failover    | Continue service during provider failures |
+| SSE streaming         | Low-latency streaming responses           |
+| TTFT tracking         | Measure first meaningful model output     |
+| Usage accounting      | Track prompt/completion tokens            |
+| Prometheus metrics    | Operational observability                 |
+| Request IDs           | Distributed request correlation           |
+| Graceful shutdown     | Controlled lifecycle management           |
+| Request size limits   | Memory/resource protection                |
 
 ---
 
-## Architectural Principles
+# Architecture
 
-1. **Zero-Allocation Hot Path:** Minimized heap allocations during request transformation, path routing, and JSON validation.
-2. **Fail-Fast Boundary:** Immediate rejection of unauthorized API keys (401), exhausted budgets (429), or oversized bodies (413) before invoking runtime async dispatchers.
-3. **Total Failure Isolation:** Downstream clients are shielded from provider outages. Provider state machines dynamically adapt without requiring manual gateway restarts.
-4. **Observable by Design:** Every request emits structured traces, Prometheus counters, histogram buckets (TTFT, latency), and error classifications with bounded label cardinality.
+## High-Level System Architecture
 
----
+```text
+┌─────────────────────────────────────────────────────────────────────┐
+│                         CLIENT APPLICATIONS                         │
+│                                                                     │
+│   Web App       Backend API       Agent       CLI       Internal AI  │
+└────────────────────────────────┬────────────────────────────────────┘
+                                 │
+                                 │ HTTP/1.1 / HTTP/2
+                                 ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                       RUST LLM GATEWAY                              │
+│                                                                     │
+│  ┌───────────────┐    ┌────────────────┐    ┌──────────────────┐   │
+│  │ Trace /       │───►│ Authentication │───►│ RPM / TPM        │   │
+│  │ Request ID    │    │                │    │ Admission        │   │
+│  └───────────────┘    └────────────────┘    └────────┬─────────┘   │
+│                                                       │             │
+│                                                       ▼             │
+│                                             ┌──────────────────┐    │
+│                                             │ Cache Layer      │    │
+│                                             │                  │    │
+│                                             │ Exact            │    │
+│                                             │ Semantic Engine  │    │
+│                                             └────────┬─────────┘    │
+│                                                      │ MISS          │
+│                                                      ▼               │
+│                                             ┌──────────────────┐    │
+│                                             │ Provider Router  │    │
+│                                             │ + Circuit Breaker│    │
+│                                             └────────┬─────────┘    │
+│                                                      │               │
+│                                                      ▼               │
+│                                             ┌──────────────────┐    │
+│                                             │ Reqwest HTTP     │    │
+│                                             │ Connection Pool   │    │
+│                                             └────────┬─────────┘    │
+│                                                      │               │
+│                         ┌────────────────────────────┼────────────┐  │
+│                         │                            │            │  │
+│                         ▼                            ▼            ▼  │
+│                    Non-streaming                 SSE stream     Retry│
+│                         │                            │               │
+│                         ▼                            ▼               │
+│                   JSON response              Incremental parser    │
+│                         │                            │               │
+│                         └──────────────┬─────────────┘               │
+│                                        ▼                             │
+│                              Usage / Latency / TTFT                  │
+│                              Reconciliation                          │
+└────────────────────────────────────────┬────────────────────────────┘
+                                         │
+             ┌───────────────────────────┼────────────────────────┐
+             ▼                           ▼                        ▼
+      ┌─────────────┐             ┌─────────────┐          ┌─────────────┐
+      │ OpenAI      │             │ Anthropic   │          │ Local LLM   │
+      │             │             │             │          │ vLLM/Ollama │
+      └─────────────┘             └─────────────┘          └─────────────┘
 
-## Verification & Test Suite
-
-```
-Test Execution Matrix
-========================================================================
-[PASS] tests::auth::test_constant_time_comparison        ............ OK
-[PASS] tests::rate_limit::test_rpm_sliding_window        ............ OK
-[PASS] tests::rate_limit::test_tpm_reservation_refund    ............ OK
-[PASS] tests::cache::test_exact_moka_lru_eviction        ............ OK
-[PASS] tests::cache::test_semantic_cosine_similarity     ............ OK
-[PASS] tests::stream::test_sse_chunk_boundary_splitting  ............ OK
-[PASS] tests::router::test_circuit_breaker_state_machine ............ OK
-[PASS] tests::proxy::test_openai_conformance             ............ OK
-------------------------------------------------------------------------
-Verification Summary: 36/36 Unit & Integration Tests PASS (100% Rate)
-Static Analysis: `cargo clippy --all-targets -- -D warnings` (Clean)
-Style Enforcement: `cargo fmt --check` (Clean)
-
-```
-
----
-
-## Project Structure
-
-```
-rust-llm-gateway/
-├── config/              # Centralized TOML configurations (providers, rate limits)
-├── src/
-│   ├── handlers/        # Chat completions, embeddings, and health endpoints
-│   ├── middleware/      # Constant-time auth, token admission, trace correlation
-│   ├── router/          # Dynamic model selector & circuit breaker state machines
-│   ├── cache/           # Moka exact hash cache & semantic similarity engine
-│   ├── proxy/           # Non-buffering SSE chunk parser & HTTP transport
-│   └── telemetry/       # Prometheus metrics exporter & OpenTelemetry hooks
-├── tests/               # Conformance, failure injection, and load test suites
-└── Dockerfile           # Minimal multi-stage scratch/distroless build
-
+                         OBSERVABILITY
+                              │
+                              ▼
+                    ┌────────────────────┐
+                    │ Prometheus Metrics  │
+                    │ Logs / Traces       │
+                    └────────────────────┘
 ```
 
 ---
 
-## Quickstart
+# Request Lifecycle
 
-### 1. Build and Run via Cargo
+A request follows a deterministic pipeline:
+
+```text
+Client Request
+      │
+      ▼
+┌───────────────────────┐
+│ Request ID / Tracing  │
+└───────────┬───────────┘
+            ▼
+┌───────────────────────┐
+│ Bearer Authentication │
+└───────────┬───────────┘
+            │ invalid
+            ├──────────────► 401
+            │
+            ▼
+┌───────────────────────┐
+│ RPM Admission         │
+└───────────┬───────────┘
+            │ exceeded
+            ├──────────────► 429 + Retry-After
+            │
+            ▼
+┌───────────────────────┐
+│ TPM Reservation       │
+└───────────┬───────────┘
+            │ insufficient
+            ├──────────────► 429
+            │
+            ▼
+┌───────────────────────┐
+│ Exact Cache Lookup    │
+└───────────┬───────────┘
+            │ HIT
+            ├──────────────► Cached Response
+            │
+            ▼ MISS
+┌───────────────────────┐
+│ Semantic Cache        │
+│ Lookup                │
+└───────────┬───────────┘
+            │ HIT
+            ├──────────────► Cached Response
+            │
+            ▼ MISS
+┌───────────────────────┐
+│ Provider Selection    │
+│ + Circuit Breaker     │
+└───────────┬───────────┘
+            ▼
+┌───────────────────────┐
+│ Reqwest Upstream      │
+└───────────┬───────────┘
+            │
+      ┌─────┴─────┐
+      │           │
+      ▼           ▼
+ Non-stream     Streaming
+      │           │
+      │           ▼
+      │      Incremental SSE
+      │      Parser
+      │           │
+      │           ▼
+      │      TTFT + Usage
+      │           │
+      └─────┬─────┘
+            ▼
+┌───────────────────────┐
+│ Token Reconciliation  │
+└───────────┬───────────┘
+            ▼
+┌───────────────────────┐
+│ Metrics / Telemetry   │
+└───────────┬───────────┘
+            ▼
+        Client
+```
+
+---
+
+# System Design Principles
+
+The project is designed around several core distributed-systems and
+high-performance backend principles.
+
+## 1. Separation of Concerns
+
+Each infrastructure responsibility is isolated:
+
+```text
+Authentication
+      │
+Rate Limiting
+      │
+Caching
+      │
+Routing
+      │
+Resilience
+      │
+Transport
+      │
+Telemetry
+```
+
+This makes individual components testable and replaceable.
+
+---
+
+## 2. Fail Fast
+
+Invalid or unauthorized requests should not consume expensive downstream
+resources.
+
+Examples:
+
+```text
+Invalid API key
+      ↓
+401 immediately
+
+RPM exhausted
+      ↓
+429 immediately
+
+TPM budget unavailable
+      ↓
+429 immediately
+
+Provider circuit OPEN
+      ↓
+Skip provider immediately
+```
+
+---
+
+## 3. Admission Control / Backpressure
+
+The gateway performs token admission before dispatching requests.
+
+```text
+Request
+   │
+   ▼
+Estimate token requirement
+   │
+   ▼
+Reserve budget
+   │
+   ├── insufficient ──► 429
+   │
+   ▼
+Dispatch upstream
+   │
+   ▼
+Actual usage
+   │
+   ▼
+Reconcile reservation
+```
+
+This prevents requests from consuming downstream capacity when the
+configured token budget is already exhausted.
+
+---
+
+## 4. Bounded Resources
+
+The gateway avoids intentionally unbounded memory growth.
+
+Bounded mechanisms include:
+
+* request body limits
+* bounded caches
+* SSE parser buffer ceiling
+* bounded metric labels
+* provider state registries
+* controlled background tasks
+
+The incremental SSE parser also enforces a 1 MiB buffer ceiling.
+
+---
+
+## 5. Failure Isolation
+
+Provider failures should not become gateway-wide failures.
+
+```text
+             Provider A
+                 │
+             failures
+                 ▼
+         ┌──────────────┐
+         │ Circuit      │
+         │ Breaker      │
+         └──────┬───────┘
+                │ OPEN
+                ▼
+          Skip Provider A
+                │
+                ▼
+          Provider B
+```
+
+This isolates unhealthy dependencies.
+
+---
+
+## 6. Graceful Degradation
+
+When possible:
+
+```text
+Primary Provider
+      │
+      ├── healthy ──► use primary
+      │
+      └── unhealthy
+             │
+             ▼
+       fallback provider
+```
+
+Caching can also prevent repeated upstream calls.
+
+---
+
+## 7. Stateless Request Processing
+
+Request processing is designed so that persistent business state is not
+tied to individual worker threads.
+
+Shared infrastructure state is held through application state and
+concurrent structures.
+
+This allows Tokio's async runtime to distribute work across worker
+threads without thread affinity.
+
+---
+
+## 8. Observability by Design
+
+Important request lifecycle events are measurable:
+
+```text
+request
+   │
+   ├── authentication
+   ├── rate limiting
+   ├── cache lookup
+   ├── provider selection
+   ├── upstream latency
+   ├── TTFT
+   ├── token usage
+   └── final response
+```
+
+This allows performance problems to be attributed rather than guessed.
+
+---
+
+## 9. Measure Before Optimizing
+
+Performance engineering follows:
+
+```text
+Correctness
+     ↓
+Observability
+     ↓
+Benchmark
+     ↓
+Identify bottleneck
+     ↓
+Optimize
+     ↓
+Benchmark again
+```
+
+Rather than:
+
+```text
+Premature optimization
+        ↓
+Complexity
+        ↓
+Unknown performance
+```
+
+---
+
+# Core Components
+
+## Authentication
+
+The gateway accepts Bearer credentials.
+
+Authentication is performed before provider dispatch.
+
+Security properties include:
+
+* API keys are not logged
+* key material is not returned in errors
+* SHA-256 based credential representation
+* constant-time comparison
+* invalid credentials fail fast
+
+---
+
+# Rate Limiting & Admission Control
+
+The gateway implements two complementary controls.
+
+## RPM
+
+Requests-per-minute admission.
+
+```text
+Client
+  │
+  ▼
+Token Bucket
+  │
+  ├── token available ──► request continues
+  │
+  └── exhausted ────────► 429
+                              │
+                              └── Retry-After
+```
+
+## TPM
+
+Tokens-per-minute admission.
+
+The gateway estimates token requirements before dispatch.
+
+```text
+Estimated Tokens
+       │
+       ▼
+┌──────────────────┐
+│ Reserve Capacity │
+└────────┬─────────┘
+         │
+         ▼
+     Upstream
+         │
+         ▼
+ Actual Usage
+         │
+         ▼
+ Reconcile Difference
+```
+
+Reservations are refunded/reconciled for:
+
+* cache hits
+* upstream failures
+* lower-than-estimated usage
+* request lifecycle termination
+
+---
+
+# Caching Architecture
+
+## Exact Cache
+
+Deterministic requests can be cached.
+
+The cache is restricted to deterministic requests such as:
+
+```text
+temperature = 0
+```
+
+Conceptually:
+
+```text
+(model + canonical request)
+              │
+              ▼
+          SHA-256
+              │
+              ▼
+        Exact Cache
+        ┌──────┴──────┐
+        │             │
+       HIT           MISS
+        │             │
+        ▼             ▼
+    response       provider
+```
+
+The implementation uses an in-memory bounded cache.
+
+---
+
+## Semantic Cache Engine
+
+The project also contains a semantic cache engine based on vector
+similarity.
+
+Conceptually:
+
+```text
+Prompt
+  │
+  ▼
+Embedding Vector
+  │
+  ▼
+Compatibility Signature
+  │
+  ▼
+Cosine Similarity
+  │
+  ├── threshold met ──► cache hit
+  │
+  └── threshold missed ► cache miss
+```
+
+Compatibility includes factors such as:
+
+* model
+* system instructions
+* tools
+* response format
+
+### Current Scope
+
+The semantic cache engine and similarity infrastructure are implemented.
+
+Integration with an actual local embedding inference model such as
+MiniLM/ONNX remains an extension point rather than being represented as
+a completed production embedding pipeline.
+
+---
+
+# Provider Routing & Resilience
+
+Providers are maintained as prioritized candidates.
+
+Conceptually:
+
+```text
+                Request
+                   │
+                   ▼
+          Provider Selector
+                   │
+          ┌────────┼────────┐
+          ▼        ▼        ▼
+       Primary  Secondary  Tertiary
+          │        │        │
+          ▼        ▼        ▼
+       Circuit   Circuit   Circuit
+       Breaker  Breaker  Breaker
+```
+
+Providers that are not eligible are skipped.
+
+Provider ordering is prepared in application state rather than repeatedly
+sorting the provider list inside the request hot path.
+
+---
+
+# Circuit Breaker
+
+Each provider has an explicit state machine:
+
+```text
+                 failures >= threshold
+          ┌───────────────────────────────┐
+          │                               ▼
+     ┌──────────┐                    ┌──────────┐
+     │  CLOSED  │                    │   OPEN   │
+     └────┬─────┘                    └────┬─────┘
+          ▲                               │
+          │                               │ cooldown
+          │                               ▼
+          │                         ┌────────────┐
+          └──── successful probe ─── │ HALF-OPEN │
+                                    └─────┬──────┘
+                                          │
+                                          └── failure → OPEN
+```
+
+Typical behavior:
+
+### CLOSED
+
+Normal requests are dispatched.
+
+### OPEN
+
+Provider is considered unhealthy and requests fail over to another
+eligible provider.
+
+### HALF-OPEN
+
+A limited probe determines whether the provider has recovered.
+
+Client-side validation errors such as `400` and `422` do not falsely mark
+a healthy provider as failed.
+
+---
+
+# Failure Classification
+
+The gateway distinguishes client errors from provider failures.
+
+| Outcome            | Typical Treatment              |
+| ------------------ | ------------------------------ |
+| 2xx                | Success                        |
+| 400                | Client error                   |
+| 401                | Provider/configuration error   |
+| 403                | Provider/configuration error   |
+| 408                | Retryable failure              |
+| 422                | Client error                   |
+| 429                | Provider capacity/rate failure |
+| 5xx                | Provider failure               |
+| Connection failure | Provider failure               |
+| Timeout            | Provider failure               |
+| Stream failure     | Provider failure               |
+
+The exact retry/failover behavior is configuration/policy dependent.
+
+---
+
+# Streaming Architecture
+
+Streaming requests use incremental SSE processing.
+
+```text
+LLM Provider
+     │
+     │ HTTP byte chunks
+     ▼
+Reqwest bytes_stream()
+     │
+     ▼
+┌─────────────────────┐
+│ Incremental SSE     │
+│ Parser              │
+└──────────┬──────────┘
+           │
+      ┌────┴───────────┐
+      │                │
+      ▼                ▼
+ Client Stream      Inspector
+      │                │
+      │                ├── TTFT
+      │                ├── Usage
+      │                └── Metrics
+      ▼
+ Client
+```
+
+The parser handles:
+
+* arbitrary TCP chunk boundaries
+* multiple SSE events per chunk
+* events split across chunks
+* LF and CRLF delimiters
+* `[DONE]`
+* trailing usage information
+* malformed JSON without panicking
+* tool-call content
+* bounded buffering
+
+The gateway does not require network chunks to align with SSE events.
+
+---
+
+# TTFT
+
+Time-to-First-Token is measured at the first meaningful model output
+rather than simply measuring the first bytes received from the network.
+
+Conceptually:
+
+```text
+Request dispatched
+       │
+       │
+       │ provider processing
+       │
+       ▼
+First meaningful content delta
+       │
+       ▼
+       TTFT
+```
+
+This provides a more useful measure of model responsiveness.
+
+---
+
+# Timeout Model
+
+The gateway separates different timeout concerns:
+
+```text
+Connection
+   │
+   ▼
+Connect Timeout
+
+HTTP request
+   │
+   ▼
+Request Timeout
+
+Streaming response
+   │
+   ▼
+Stream Idle Timeout
+```
+
+A continuously active stream should not be treated as idle merely because
+its total duration is long.
+
+---
+
+# Observability
+
+The gateway exposes Prometheus-compatible metrics through:
+
+```text
+GET /metrics
+```
+
+Tracked telemetry includes concepts such as:
+
+* request counts
+* request latency
+* gateway overhead
+* TTFT
+* token usage
+* provider failures
+* cache hits/misses
+* rate-limit events
+* circuit state
+
+Metric labels are intentionally bounded.
+
+Raw user-controlled values are not used as arbitrary metric labels.
+
+---
+
+# Security
+
+Security principles include:
+
+```text
+                    Security Boundary
+
+Client
+  │
+  ▼
+Authentication
+  │
+  ▼
+Validated Internal Identity
+  │
+  ▼
+Gateway
+  │
+  ▼
+Provider
+```
+
+Implemented protections include:
+
+* Bearer authentication
+* constant-time credential comparison
+* hashed credential representation
+* no API-key logging
+* sanitized upstream errors
+* request body limits
+* bounded SSE buffering
+* bounded metric cardinality
+* configuration validation
+* no unnecessary credential propagation
+
+Internal upstream details such as URLs, addresses, and stack traces are
+not returned directly to clients.
+
+---
+
+# API
+
+The gateway exposes an OpenAI-compatible API surface.
+
+## Chat Completions
+
+```http
+POST /v1/chat/completions
+```
+
+Supports:
+
+* standard JSON responses
+* streaming responses
+* OpenAI-compatible message structures
+* provider routing
+* caching where eligible
+* token accounting
+
+Example:
 
 ```bash
-# Clone the repository
-git clone https://github.com/your-username/rust-llm-gateway.git
-cd rust-llm-gateway
-
-# Run locally in release mode
-cargo run --release
-
+curl http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "your-model",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Explain Rust ownership in one paragraph."
+      }
+    ],
+    "temperature": 0
+  }'
 ```
 
-### 2. Run via Docker
+---
+
+## Streaming
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "your-model",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Explain async Rust."
+      }
+    ],
+    "stream": true
+  }'
+```
+
+---
+
+## Embeddings
+
+```http
+POST /v1/embeddings
+```
+
+Example:
+
+```bash
+curl http://localhost:8080/v1/embeddings \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "embedding-model",
+    "input": "Rust is a systems programming language."
+  }'
+```
+
+---
+
+## Health
+
+```http
+GET /healthz
+```
+
+Example:
+
+```bash
+curl http://localhost:8080/healthz
+```
+
+---
+
+## Metrics
+
+```http
+GET /metrics
+```
+
+Example:
+
+```bash
+curl http://localhost:8080/metrics
+```
+
+See [API.md](API.md) for detailed endpoint behavior.
+
+---
+
+# Configuration
+
+Configuration is provided through TOML.
+
+Example structure:
+
+```toml
+[server]
+host = "0.0.0.0"
+port = 8080
+
+[rate_limit]
+rpm = 60
+tpm = 100000
+
+[cache]
+enabled = true
+
+[providers]
+# Configure provider-specific settings here.
+```
+
+Provider configuration includes separate timeout controls such as:
+
+```text
+connect_timeout_seconds
+request_timeout_seconds
+stream_idle_timeout_seconds
+```
+
+See [CONFIGURATION.md](CONFIGURATION.md) for the complete configuration
+reference.
+
+---
+
+# Performance
+
+Performance measurements were performed against a release build using
+optimization, LTO, a single codegen unit, panic abort, and symbol stripping.
+
+## Release Artifact
+
+| Metric         |                 Result |
+| -------------- | ---------------------: |
+| Target         | x86_64-pc-windows-msvc |
+| Rust           |                  1.88+ |
+| Binary size    |            **4.26 MB** |
+| Optimization   |        `opt-level = 3` |
+| LTO            |                Enabled |
+| Codegen units  |                      1 |
+| Panic strategy |                `abort` |
+| Symbols        |               Stripped |
+
+---
+
+## Gateway Overhead
+
+Gateway overhead is measured as the difference between direct mock-provider
+latency and the corresponding proxied gateway latency.
+
+| Requests | Net p50 |     Net p95 | Target | Result |
+| -------: | ------: | ----------: | -----: | ------ |
+|      100 | 0.13 ms | **0.19 ms** |  ≤5 ms | PASS   |
+|    1,000 | 0.12 ms | **0.23 ms** |  ≤5 ms | PASS   |
+|   10,000 | 0.10 ms | **0.22 ms** |  ≤5 ms | PASS   |
+
+Measured p95 overhead is approximately **0.22 ms**, substantially below
+the 5 ms target. 
+
+---
+
+# Throughput & Concurrency
+
+Measured stress-test results:
+
+| Concurrency | Requests |       RPS |       p50 |       p95 | Success |       RSS |
+| ----------: | -------: | --------: | --------: | --------: | ------: | --------: |
+|         100 |      200 | **4,039** |  18.93 ms |  33.13 ms |    100% |  19.52 MB |
+|         500 |    1,000 | **5,375** |  72.85 ms | 117.54 ms |    100% |  46.24 MB |
+|       1,000 |    2,000 | **4,231** | 198.52 ms | 290.69 ms |    100% | 115.80 MB |
+|       5,000 |   10,000 |     1,126 |    3.57 s |    5.43 s |   78.0% | 408.07 MB |
+|      10,000 |   20,000 |        55 |    9.98 s |   10.35 s |    2.8% | 488.26 MB |
+
+The benchmark evidence shows 100% request success through 1,000 concurrent
+requests. The 5K–10K Windows localhost tests experienced TCP ephemeral-port
+exhaustion (`WSAEADDRINUSE` / connection reset) during the synchronous
+barrier release. The gateway process remained stable without panics. 
+
+Therefore:
+
+> **10,000 concurrent connections is a PRD target, not a claim of 10K successful
+> Windows localhost client connections.**
+
+A production deployment should validate the target under an appropriate
+Linux/networking environment and with a distributed load generator.
+
+---
+
+# Memory Footprint
+
+Working-set/RSS measurements:
+
+| State             |           RSS | Target | Status   |
+| ----------------- | ------------: | -----: | -------- |
+| Idle              |   **5.48 MB** | <50 MB | PASS     |
+| 100 connections   |  **19.52 MB** | <50 MB | PASS     |
+| 500 connections   |  **46.24 MB** | <50 MB | PASS     |
+| 1,000 connections | **115.80 MB** |      — | Measured |
+
+The idle footprint is approximately **5.48 MB**, well below the 50 MB
+baseline target. 
+
+The 50 MB figure should therefore be interpreted as a **base/idle footprint
+target**, not a claim that the process remains below 50 MB at 1,000 active
+connections.
+
+---
+
+# Streaming Performance
+
+Incremental streaming tests verified that the gateway processes streams
+without buffering the complete response.
+
+Measured stream cases included:
+
+|       Stream |     TTFT | Stream behavior |
+| -----------: | -------: | --------------- |
+|    10 tokens | <0.10 ms | Incremental     |
+|   100 tokens | <0.10 ms | Incremental     |
+| 1,000 tokens | <0.10 ms | Incremental     |
+
+The benchmark suite reports incremental/unbuffered behavior across all
+tested stream sizes. 
+
+---
+
+# Cache Performance
+
+| Operation                  |         p50 |         p95 |
+| -------------------------- | ----------: | ----------: |
+| Exact cache hit            | **0.14 ms** | **0.42 ms** |
+| Semantic vector similarity |    <0.10 µs |     0.10 µs |
+
+The exact cache uses an in-memory Moka cache and the semantic engine uses
+vector cosine similarity. 
+
+---
+
+# Rate-Limit Performance
+
+| Operation        |     p50 |     p95 |
+| ---------------- | ------: | ------: |
+| RPM token bucket | 0.10 µs | 0.10 µs |
+| TPM reservation  | 0.10 µs | 0.10 µs |
+
+Rejected requests are prevented from reaching upstream providers and
+return `429` with `Retry-After` behavior. 
+
+---
+
+# Testing
+
+The project currently reports:
+
+> **36 / 36 tests passing — 100% success rate**
+
+Test coverage includes unit tests, integration tests, streaming behavior,
+authentication, caching, rate limiting, failover, metrics, and resilience.
+
+The test report records:
+
+```text
+Unit Tests              26 / 26 PASS
+Integration Tests       10 / 10 PASS
+cargo fmt --check             PASS
+cargo check --all-targets     PASS
+cargo clippy                   PASS
+```
+
+The complete verification report documents the test execution and
+subsystem-level coverage. 
+
+---
+
+# Test Categories
+
+## Authentication
+
+* valid credentials
+* invalid credentials
+* unauthorized requests
+* credential comparison
+
+## Rate Limiting
+
+* RPM exhaustion
+* TPM admission
+* Retry-After
+* reservation lifecycle
+* reconciliation
+
+## Cache
+
+* insert/get
+* cache hit
+* cache miss
+* temperature restrictions
+* model isolation
+* prompt isolation
+* semantic similarity
+
+## Streaming
+
+* SSE parsing
+* chunk boundaries
+* multiple events
+* `[DONE]`
+* usage extraction
+* TTFT
+* malformed events
+* streaming lifecycle
+
+## Resilience
+
+* provider failure
+* timeout
+* failover
+* circuit breaker
+* half-open recovery
+
+## API
+
+* chat completions
+* embeddings
+* health endpoint
+* metrics endpoint
+
+---
+
+# Project Structure
+
+```text
+rust-llm-gateway/
+│
+├── Cargo.toml
+├── Cargo.lock
+├── Dockerfile
+├── .dockerignore
+│
+├── config/
+│   └── default.toml
+│
+├── src/
+│   ├── main.rs
+│   ├── lib.rs
+│   ├── config.rs
+│   ├── state.rs
+│   ├── error.rs
+│   │
+│   ├── handlers/
+│   │   ├── chat.rs
+│   │   └── embeddings.rs
+│   │
+│   ├── middleware/
+│   │   ├── mod.rs
+│   │   ├── auth.rs
+│   │   ├── rate_limit.rs
+│   │   └── trace.rs
+│   │
+│   ├── router/
+│   │   ├── mod.rs
+│   │   ├── selector.rs
+│   │   └── circuit_breaker.rs
+│   │
+│   ├── cache/
+│   │   ├── mod.rs
+│   │   ├── exact.rs
+│   │   └── semantic.rs
+│   │
+│   ├── proxy/
+│   │   ├── mod.rs
+│   │   ├── client.rs
+│   │   ├── sse_parser.rs
+│   │   └── stream.rs
+│   │
+│   └── telemetry/
+│       ├── mod.rs
+│       └── metrics.rs
+│
+├── tests/
+│   ├── integration_tests.rs
+│   └── load_test.js
+│
+├── ARCHITECTURE.md
+├── API.md
+├── CONFIGURATION.md
+├── SECURITY.md
+├── BENCHMARKS.md
+├── DEVELOPMENT.md
+├── TEST_REPORT.md
+├── COMPLETION_REPORT.md
+└── FINAL_RELEASE_REPORT.md
+```
+
+---
+
+# Running Locally
+
+## Prerequisites
+
+* Rust 1.88+
+* Cargo
+* A configured upstream LLM provider
+
+Verify Rust:
+
+```bash
+rustc --version
+cargo --version
+```
+
+---
+
+## Clone
+
+```bash
+git clone <your-repository-url>
+cd rust-llm-gateway
+```
+
+---
+
+## Configure
+
+Review:
+
+```text
+config/default.toml
+```
+
+Configure provider endpoints, authentication, rate limits, caching,
+timeouts, and server settings.
+
+---
+
+## Run
+
+Development:
+
+```bash
+cargo run
+```
+
+Release:
+
+```bash
+cargo run --release
+```
+
+---
+
+# Quality Checks
+
+Format:
+
+```bash
+cargo fmt --check
+```
+
+Compile:
+
+```bash
+cargo check --all-targets
+```
+
+Test:
+
+```bash
+cargo test --all-targets
+```
+
+Lint:
+
+```bash
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+Security/dependency audit:
+
+```bash
+cargo audit
+```
+
+Build release:
+
+```bash
+cargo build --release
+```
+
+---
+
+# Docker
+
+The project includes a multi-stage Docker build.
+
+Build:
 
 ```bash
 docker build -t rust-llm-gateway .
-docker run -p 8080:8080 -v $(pwd)/config:/config rust-llm-gateway
-
 ```
 
-### 3. Verify Health & Route Completion
+Run:
 
 ```bash
-# Health Check
-curl http://localhost:8080/healthz
+docker run \
+  -p 8080:8080 \
+  rust-llm-gateway
+```
 
-# Proxy Chat Completion
-curl http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer YOUR_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-4o-mini",
-    "messages": [
-      {"role": "user", "content": "Explain async runtimes in Rust."}
-    ],
-    "temperature": 0
-  }'
+The image is designed around:
 
+* multi-stage compilation
+* minimal runtime image
+* non-root execution
+* health checking
+* release optimization
+
+---
+
+# Design Decisions
+
+## Why Rust?
+
+The gateway is primarily an I/O-bound concurrent system where predictable
+resource usage and efficient async execution are important.
+
+Rust provides:
+
+* memory safety
+* zero-cost abstractions
+* strong type guarantees
+* predictable ownership
+* efficient async execution
+* no garbage collector
+* excellent concurrency primitives
+
+---
+
+## Why Tokio?
+
+Tokio provides the asynchronous runtime used for:
+
+* concurrent HTTP requests
+* timers
+* streaming
+* cancellation
+* background tasks
+* connection handling
+
+---
+
+## Why Axum?
+
+Axum provides a lightweight typed HTTP layer built around Tokio and Tower.
+
+This makes middleware composition natural:
+
+```text
+Trace
+  ↓
+Auth
+  ↓
+Rate Limit
+  ↓
+Handler
 ```
 
 ---
 
-## Roadmap
+## Why Reqwest?
 
-```mermaid
-gantt
-    title System Development Milestones
-    dateFormat  YYYY-MM
-    section Core (v1.0-alpha)
-    OpenAI Conformance & Routing  :done,    m1, 2026-01, 2026-03
-    Zero-Buffering SSE Stream     :done,    m2, 2026-02, 2026-04
-    Exact In-Memory Cache (Moka)  :done,    m3, 2026-03, 2026-05
-    section Expansion (v1.1)
-    Local ONNX Embedding Model    :active,  m4, 2026-06, 2026-08
-    Distributed Redis Cache Tier  :         m5, 2026-08, 2026-10
-    section Enterprise (v2.0)
-    Global Edge Mesh Routing      :         m6, 2026-10, 2027-01
-    Cost-Aware Dynamic Balancing  :         m7, 2026-11, 2027-02
+Reqwest provides:
 
+* async HTTP
+* connection pooling
+* streaming bodies
+* TLS
+* configurable timeouts
+
+It acts as the outbound transport layer.
+
+---
+
+## Why In-Memory Caching?
+
+The first cache layer is intentionally local.
+
+Advantages:
+
+* extremely low latency
+* no network hop
+* simple operational model
+* predictable performance
+
+The architecture can later support distributed caches.
+
+---
+
+# Reliability Model
+
+The gateway treats external LLM providers as unreliable dependencies.
+
+Therefore:
+
+```text
+Provider
+   │
+   ├── latency
+   ├── timeout
+   ├── 429
+   ├── 5xx
+   ├── connection failure
+   └── stream failure
+          │
+          ▼
+    Failure Classifier
+          │
+          ▼
+    Circuit Breaker
+          │
+          ▼
+      Failover
+```
+
+This prevents one unhealthy provider from unnecessarily taking down the
+entire request path.
+
+---
+
+# Concurrency Model
+
+The architecture is based on asynchronous I/O rather than a thread-per-request
+model.
+
+Conceptually:
+
+```text
+                Tokio Runtime
+                     │
+        ┌────────────┼────────────┐
+        ▼            ▼            ▼
+     Worker 1     Worker 2     Worker N
+        │            │            │
+        └────────────┼────────────┘
+                     │
+              Shared AppState
+                     │
+       ┌─────────────┼─────────────┐
+       ▼             ▼             ▼
+   Rate Limits      Cache      Breakers
+```
+
+Shared state is designed around concurrent data structures and immutable
+configuration where practical.
+
+---
+
+# Performance Engineering Philosophy
+
+The project separates three different measurements:
+
+```text
+Gateway overhead
+       ≠
+Network latency
+       ≠
+LLM inference latency
+```
+
+This is important when evaluating an LLM gateway.
+
+A slow model should not make the gateway itself appear slow.
+
+Therefore benchmark infrastructure uses deterministic mock upstream
+providers to isolate gateway behavior.
+
+---
+
+# Known Limitations
+
+## 1. Semantic Embedding Inference
+
+The semantic cache engine is implemented, but actual local embedding model
+inference is an extension point.
+
+A future implementation can integrate:
+
+* ONNX Runtime
+* MiniLM
+* Candle
+* another local embedding model
+
+---
+
+## 2. Distributed Rate Limiting
+
+Current rate limiting is in-memory and node-local.
+
+A multi-instance deployment would require shared coordination, such as:
+
+```text
+Gateway A ─┐
+Gateway B ─┼──► Distributed Rate Limiter
+Gateway C ─┘
+```
+
+Potential future implementations could use Redis or another shared state
+system.
+
+---
+
+## 3. High-Concurrency Windows Benchmark
+
+The gateway was stress-tested at 5K and 10K concurrent request levels.
+
+Those localhost tests were constrained by Windows TCP ephemeral-port/socket
+exhaustion during the load generator's synchronized connection burst.
+
+The gateway remained stable without panics, but those runs should not be
+interpreted as successful validation of 10K concurrent client connections.
+
+Production-scale concurrency should be validated in an appropriate Linux
+deployment environment with a dedicated load generator.
+
+---
+
+# Roadmap
+
+## v1.0
+
+Current release candidate:
+
+* OpenAI-compatible API
+* authentication
+* RPM/TPM limiting
+* exact cache
+* semantic cache engine
+* provider routing
+* circuit breaker
+* failover
+* SSE
+* TTFT
+* usage accounting
+* Prometheus metrics
+* Docker
+* integration testing
+
+---
+
+## v1.1
+
+Potential improvements:
+
+* local embedding inference
+* distributed rate limiting
+* distributed cache
+* richer provider health checks
+* adaptive routing
+* cost-aware provider selection
+* improved Linux high-concurrency benchmarking
+
+---
+
+## v2.0
+
+Potential advanced infrastructure:
+
+```text
+                    Global Gateway
+                         │
+          ┌──────────────┼──────────────┐
+          ▼              ▼              ▼
+       Region A        Region B       Region C
+          │              │              │
+       Gateway         Gateway         Gateway
+          │              │              │
+          └──────────────┼──────────────┘
+                         │
+                 Shared Control Plane
+```
+
+Possible additions:
+
+* distributed routing
+* global rate limiting
+* provider cost optimization
+* dynamic health scoring
+* adaptive load balancing
+* multi-region deployment
+
+---
+
+
+
+---
+
+# Project Status
+
+```text
+                    RUST LLM GATEWAY
+
+              ┌──────────────────────┐
+              │ Functional Core      │
+              │       COMPLETE       │
+              └──────────┬───────────┘
+                         │
+              ┌──────────▼───────────┐
+              │ Automated Tests      │
+              │      36 / 36         │
+              └──────────┬───────────┘
+                         │
+              ┌──────────▼───────────┐
+              │ Code Quality         │
+              │ fmt + clippy PASS    │
+              └──────────┬───────────┘
+                         │
+              ┌──────────▼───────────┐
+              │ Performance          │
+              │ Measured             │
+              └──────────┬───────────┘
+                         │
+              ┌──────────▼───────────┐
+              │ Release Candidate    │
+              │    v1.0.0-alpha      │
+              └──────────────────────┘
 ```
 
 ---
 
-## Author & Maintainer
+# Engineering Highlights
+
+The project demonstrates practical engineering across several layers:
+
+### Systems Programming
+
+* Rust ownership and borrowing
+* async execution
+* concurrent state
+* memory-bounded processing
+* cancellation
+
+### AI Infrastructure
+
+* LLM provider abstraction
+* token accounting
+* model routing
+* exact caching
+* semantic cache engine
+* streaming inference
+
+### Distributed Systems
+
+* circuit breakers
+* retries/failover
+* admission control
+* failure classification
+* graceful degradation
+
+### Performance Engineering
+
+* connection pooling
+* incremental streaming
+* bounded allocations
+* hot-path optimization
+* benchmark-driven optimization
+
+### Production Engineering
+
+* authentication
+* sanitized errors
+* structured telemetry
+* Prometheus metrics
+* Docker packaging
+* automated testing
+
+---
+
+# Key Measured Results
+
+| Metric                            |                        Result |
+| --------------------------------- | ----------------------------: |
+| Automated tests                   |                   **36 / 36** |
+| Gateway overhead p95              |                   **0.22 ms** |
+| Peak measured throughput          |                 **5,375 RPS** |
+| Idle RSS                          |                   **5.48 MB** |
+| Successful concurrency validation | **1,000 concurrent requests** |
+| Exact cache hit p50               |                   **0.14 ms** |
+| RPM limiter p95                   |                   **0.10 µs** |
+| TPM reservation p95               |                   **0.10 µs** |
+| Release binary                    |                   **4.26 MB** |
+
+---
+
+# License
+
+Add your chosen license here.
+
+Example:
+
+```text
+MIT License
+```
+
+---
+
+# Author
 
 **Ruchir Huchgol**
 
-AI Infrastructure | High-Performance Systems | Rust Backend Engineering
+AI Engineer | Rust | LLM Infrastructure | Backend Systems
 
 ---
 
-## License
-
-This project is open-source software licensed under the [MIT License](https://www.google.com/search?q=LICENSE).
+> Built as an exploration of production-oriented AI infrastructure:
+> combining Rust systems engineering with LLM routing, streaming,
+> resilience, caching, rate limiting, and observability.
